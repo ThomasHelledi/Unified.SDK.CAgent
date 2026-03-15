@@ -9,9 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/docker/docker-agent/pkg/tmux"
-	agenttools "github.com/docker/docker-agent/pkg/tools"
-	tmuxtools "github.com/docker/docker-agent/pkg/tools/tmux"
+	"github.com/docker/docker-agent/pkg/terminal"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/spf13/cobra"
@@ -26,47 +24,36 @@ func main() {
 func rootCmd() *cobra.Command {
 	var (
 		port      int
-		tmuxPath  string
+		shell     string
 		agentsDir string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "thorshammer",
-		Short: "ThorsHammer — CAgent server with tmux control capabilities",
-		Long: `ThorsHammer integrates the CAgent SDK with tmux to provide
-LLM-callable tools for terminal session management. It runs a lightweight
-HTTP server exposing tmux operations as both REST endpoints and agent tools.`,
+		Short: "ThorsHammer — Unified AI Terminal Orchestration",
+		Long: `ThorsHammer manages persistent terminal sessions for LLM agents.
+No tmux dependency — uses our own terminal session manager with piped I/O,
+ring buffer capture, and REST API for session management.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return run(cmd.Context(), port, tmuxPath, agentsDir)
+			return run(cmd.Context(), port, shell, agentsDir)
 		},
 	}
 
 	cmd.Flags().IntVar(&port, "port", 8081, "HTTP server port")
-	cmd.Flags().StringVar(&tmuxPath, "tmux-path", "tmux", "Path to tmux binary")
-	cmd.Flags().StringVar(&agentsDir, "agents-dir", ".agents", "Directory containing agent definitions")
+	cmd.Flags().StringVar(&shell, "shell", "/bin/zsh", "Shell binary for terminal sessions")
+	cmd.Flags().StringVar(&agentsDir, "agents-dir", ".agents", "Directory containing agent YAML definitions")
 
 	return cmd
 }
 
-func run(ctx context.Context, port int, tmuxPath, agentsDir string) error {
+func run(ctx context.Context, port int, shell, agentsDir string) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Initialize tmux controller.
-	controller := tmux.NewController(tmuxPath)
-
-	slog.Info("starting tmux server", "binary", tmuxPath)
-	if err := controller.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start tmux server: %w", err)
-	}
-	defer func() {
-		slog.Info("shutting down tmux server")
-		_ = controller.Stop()
-	}()
-
-	// Create the tmux tool set for agent registration.
-	toolSet := tmuxtools.NewTmuxToolSet(controller)
+	// Initialize our terminal session manager (no tmux needed).
+	mgr := terminal.NewManager(shell, 500)
+	defer mgr.StopAll()
 
 	// Set up Echo HTTP server.
 	e := echo.New()
@@ -74,7 +61,7 @@ func run(ctx context.Context, port int, tmuxPath, agentsDir string) error {
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
-	// Health and status endpoints.
+	// Health endpoint.
 	e.GET("/api/ping", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{
 			"status": "ok",
@@ -82,74 +69,23 @@ func run(ctx context.Context, port int, tmuxPath, agentsDir string) error {
 		})
 	})
 
+	// Status endpoint.
 	e.GET("/api/status", func(c echo.Context) error {
+		sessions := mgr.ListSessions()
 		return c.JSON(http.StatusOK, map[string]any{
-			"tmux_running": controller.IsRunning(),
-			"socket":       controller.SocketName(),
-			"binary":       controller.BinaryPath(),
-			"agents_dir":   agentsDir,
+			"shell":           shell,
+			"agents_dir":      agentsDir,
+			"active_sessions": mgr.ActiveCount(),
+			"total_sessions":  len(sessions),
 		})
 	})
 
-	// Tmux REST endpoints.
-	tmuxGroup := e.Group("/api/tmux")
-	registerTmuxRoutes(tmuxGroup, controller)
-
-	// Tool listing endpoint (for agent discovery).
-	e.GET("/api/tools", func(c echo.Context) error {
-		toolList, err := toolSet.Tools(c.Request().Context())
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError,
-				fmt.Sprintf("failed to list tools: %v", err))
-		}
-		return c.JSON(http.StatusOK, toolList)
-	})
-
-	// Tool execution endpoint (for agent invocation).
-	e.POST("/api/tools/execute", func(c echo.Context) error {
-		var req struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		}
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest,
-				fmt.Sprintf("invalid request body: %v", err))
-		}
-
-		toolList, err := toolSet.Tools(c.Request().Context())
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError,
-				fmt.Sprintf("failed to list tools: %v", err))
-		}
-
-		for _, tool := range toolList {
-			if tool.Name != req.Name {
-				continue
-			}
-
-			tc := agenttools.ToolCall{
-				Type: "function",
-				Function: agenttools.FunctionCall{
-					Name:      req.Name,
-					Arguments: req.Arguments,
-				},
-			}
-
-			result, err := tool.Handler(c.Request().Context(), tc)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusInternalServerError,
-					fmt.Sprintf("tool execution failed: %v", err))
-			}
-			return c.JSON(http.StatusOK, result)
-		}
-
-		return echo.NewHTTPError(http.StatusNotFound,
-			fmt.Sprintf("tool %q not found", req.Name))
-	})
+	// Session management routes (replaces tmux routes).
+	registerSessionRoutes(e, mgr)
 
 	// Start the HTTP server.
 	addr := fmt.Sprintf(":%d", port)
-	slog.Info("starting ThorsHammer server", "addr", addr, "agents_dir", agentsDir)
+	slog.Info("starting ThorsHammer server", "addr", addr, "shell", shell, "agents_dir", agentsDir)
 
 	go func() {
 		if err := e.Start(addr); err != nil && err != http.ErrServerClosed {
@@ -158,80 +94,121 @@ func run(ctx context.Context, port int, tmuxPath, agentsDir string) error {
 		}
 	}()
 
-	// Wait for shutdown signal.
 	<-ctx.Done()
 	slog.Info("shutting down server")
-
 	return e.Close()
 }
 
-// registerTmuxRoutes sets up the REST API routes for direct tmux operations.
-func registerTmuxRoutes(g *echo.Group, ctrl *tmux.Controller) {
-	// Sessions
+// registerSessionRoutes sets up REST API for terminal session management.
+// Routes kept under /api/tmux/ for backward compatibility with C# service.
+func registerSessionRoutes(e *echo.Echo, mgr *terminal.Manager) {
+	g := e.Group("/api/tmux")
+
+	// POST /api/tmux/sessions — create new terminal session
 	g.POST("/sessions", func(c echo.Context) error {
 		var req struct {
-			Name string `json:"name"`
+			Name    string `json:"name"`
+			WorkDir string `json:"work_dir,omitempty"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		id, err := ctrl.CreateSession(c.Request().Context(), req.Name)
+		if req.Name == "" {
+			req.Name = "session"
+		}
+
+		session, err := mgr.CreateSession(c.Request().Context(), req.Name, req.WorkDir, nil)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
+
 		return c.JSON(http.StatusCreated, map[string]string{
-			"name": req.Name,
-			"id":   id,
+			"id":   session.ID,
+			"name": session.Name,
 		})
 	})
 
+	// GET /api/tmux/sessions — list sessions
 	g.GET("/sessions", func(c echo.Context) error {
-		sessions, err := ctrl.ListSessions(c.Request().Context())
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		sessions := mgr.ListSessions()
+
+		type sessionInfo struct {
+			ID        string                 `json:"id"`
+			Name      string                 `json:"name"`
+			State     terminal.SessionState  `json:"state"`
+			ExitCode  int                    `json:"exit_code"`
+			Lines     int                    `json:"output_lines"`
+			CreatedAt string                 `json:"created_at"`
 		}
-		return c.JSON(http.StatusOK, sessions)
+
+		result := make([]sessionInfo, len(sessions))
+		for i, s := range sessions {
+			result[i] = sessionInfo{
+				ID:        s.ID,
+				Name:      s.Name,
+				State:     s.State,
+				ExitCode:  s.ExitCode,
+				Lines:     s.OutputCount(),
+				CreatedAt: s.CreatedAt.Format("2006-01-02T15:04:05Z"),
+			}
+		}
+		return c.JSON(http.StatusOK, result)
 	})
 
-	g.DELETE("/sessions/:name", func(c echo.Context) error {
-		if err := ctrl.KillSession(c.Request().Context(), c.Param("name")); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	// GET /api/tmux/sessions/:id — get session detail
+	g.GET("/sessions/:id", func(c echo.Context) error {
+		session := mgr.GetSession(c.Param("id"))
+		if session == nil {
+			return echo.NewHTTPError(http.StatusNotFound, "session not found")
 		}
-		return c.JSON(http.StatusOK, map[string]string{"message": "session killed"})
+		return c.JSON(http.StatusOK, session)
 	})
 
-	// Panes
-	g.GET("/sessions/:name/panes", func(c echo.Context) error {
-		panes, err := ctrl.ListPanes(c.Request().Context(), c.Param("name"))
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	// DELETE /api/tmux/sessions/:id — stop and delete session
+	g.DELETE("/sessions/:id", func(c echo.Context) error {
+		if err := mgr.DeleteSession(c.Param("id")); err != nil {
+			return echo.NewHTTPError(http.StatusNotFound, err.Error())
 		}
-		return c.JSON(http.StatusOK, panes)
+		return c.JSON(http.StatusOK, map[string]string{"message": "session deleted"})
 	})
 
-	g.POST("/sessions/:name/panes", func(c echo.Context) error {
-		pane, err := ctrl.CreatePane(c.Request().Context(), c.Param("name"))
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		return c.JSON(http.StatusCreated, pane)
-	})
-
-	g.POST("/sessions/:name/panes/:pane/resize", func(c echo.Context) error {
+	// POST /api/tmux/sessions/:id/input — send input to session
+	g.POST("/sessions/:id/input", func(c echo.Context) error {
 		var req struct {
-			Width  int `json:"width"`
-			Height int `json:"height"`
+			Input string `json:"input"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		if err := ctrl.ResizePane(c.Request().Context(), c.Param("pane"), req.Width, req.Height); err != nil {
+		if err := mgr.SendInput(c.Param("id"), req.Input); err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
-		return c.JSON(http.StatusOK, map[string]string{"message": "pane resized"})
+		return c.JSON(http.StatusOK, map[string]string{"message": "input sent"})
 	})
 
-	// Commands
+	// GET /api/tmux/sessions/:id/output — get buffered output
+	g.GET("/sessions/:id/output", func(c echo.Context) error {
+		session := mgr.GetSession(c.Param("id"))
+		if session == nil {
+			return echo.NewHTTPError(http.StatusNotFound, "session not found")
+		}
+
+		lastN := 50
+		if n := c.QueryParam("lastN"); n != "" {
+			fmt.Sscanf(n, "%d", &lastN)
+		}
+
+		lines := session.Output(lastN)
+		return c.JSON(http.StatusOK, map[string]any{
+			"session_id": session.ID,
+			"state":      session.State,
+			"total":      session.OutputCount(),
+			"returned":   len(lines),
+			"lines":      lines,
+		})
+	})
+
+	// POST /api/tmux/send-keys — backward compat: send input by target ID
 	g.POST("/send-keys", func(c echo.Context) error {
 		var req struct {
 			Target  string `json:"target"`
@@ -241,53 +218,32 @@ func registerTmuxRoutes(g *echo.Group, ctrl *tmux.Controller) {
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		if err := ctrl.SendKeys(c.Request().Context(), req.Target, req.Keys, req.Literal); err != nil {
+		if err := mgr.SendInput(req.Target, req.Keys); err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
-		return c.JSON(http.StatusOK, map[string]string{"message": "keys sent"})
+		return c.JSON(http.StatusOK, map[string]string{"message": "input sent"})
 	})
 
-	g.POST("/capture", func(c echo.Context) error {
-		var req struct {
-			Target string `json:"target"`
-		}
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-		}
-		content, err := ctrl.CapturePane(c.Request().Context(), req.Target)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		return c.JSON(http.StatusOK, map[string]string{"content": content})
-	})
-
+	// POST /api/tmux/run — run command in new session, return output
 	g.POST("/run", func(c echo.Context) error {
 		var req struct {
-			Target  string `json:"target"`
 			Command string `json:"command"`
+			WorkDir string `json:"work_dir,omitempty"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		output, err := ctrl.RunShell(c.Request().Context(), req.Target, req.Command)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		return c.JSON(http.StatusOK, map[string]string{"output": output})
-	})
 
-	// Control mode
-	g.POST("/sessions/:name/control", func(c echo.Context) error {
-		client, err := ctrl.StartControlMode(c.Request().Context(), c.Param("name"))
+		session, err := mgr.RunCommand(c.Request().Context(), "run", req.Command, req.WorkDir)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
-		// For REST, we return immediately. The control client runs in the background.
-		// A WebSocket upgrade would be more appropriate for streaming events.
-		_ = client
-		return c.JSON(http.StatusOK, map[string]string{
-			"message": "control mode started",
-			"session": c.Param("name"),
+
+		lines := session.Output(0)
+		return c.JSON(http.StatusOK, map[string]any{
+			"session_id": session.ID,
+			"exit_code":  session.ExitCode,
+			"lines":      lines,
 		})
 	})
 }
