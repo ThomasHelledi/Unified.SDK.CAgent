@@ -60,6 +60,10 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("tmux binary not found at %q: %w", c.binaryPath, err)
 	}
 
+	// Kill any stale tmux server on this socket before starting fresh.
+	killCmd := exec.Command(c.binaryPath, "-L", c.socketName, "kill-server")
+	_ = killCmd.Run() // ignore error — may not be running
+
 	// Start a detached session named "_init" to bootstrap the server.
 	// This keeps the server process alive until we explicitly kill it.
 	serverCtx, cancel := context.WithCancel(ctx)
